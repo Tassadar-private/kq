@@ -218,11 +218,119 @@ def split_kw(kw: str) -> tuple[str, str, str] | None:
     return m.group(1).upper(), m.group(2), m.group(3)
 
 
-def build_driver() -> webdriver.Chrome:
+DEBUG_PORT = 9222
+CHROME_PROFILE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ekw_chrome_profile"
+
+CHROME_CANDIDATES = [
+    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe",
+    Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+]
+
+
+def find_chrome_exe() -> Path | None:
+    for p in CHROME_CANDIDATES:
+        if p and p.is_file():
+            return p
+    return None
+
+
+def is_debug_chrome_running(port: int = DEBUG_PORT) -> bool:
+    """Sprawdza, czy na lokalnym porcie działa Chrome z DevTools Protocol."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        try:
+            return s.connect_ex(("127.0.0.1", port)) == 0
+        except OSError:
+            return False
+
+
+def launch_debug_chrome(port: int = DEBUG_PORT, url: str = EKW_URL) -> None:
+    """Uruchamia Chrome w osobnym profilu z włączonym DevTools Protocol.
+    Flagi ukrywają paski 'nieobsługiwana flaga' i 'sterowane przez automat'."""
+    import subprocess
+
+    if is_debug_chrome_running(port):
+        print(f"Chrome z DevTools już nasłuchuje na porcie {port} — używam istniejącego.")
+        return
+
+    chrome = find_chrome_exe()
+    if chrome is None:
+        print("Nie znaleziono chrome.exe. Zainstaluj Google Chrome.")
+        sys.exit(1)
+
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    args = [
+        str(chrome),
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={CHROME_PROFILE_DIR}",
+        "--test-type",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        "--disable-features=InfobarOnTranslate,Translate",
+        "--disable-blink-features=AutomationControlled",
+        url,
+    ]
+    print(f"Uruchamiam Chrome (port {port}, profil: {CHROME_PROFILE_DIR})…")
+    # DETACHED_PROCESS + nowa grupa — Chrome przeżyje zamknięcie terminala.
+    creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(args, close_fds=True, creationflags=creationflags)
+
+    for _ in range(50):  # do ~10 s na rozruch
+        if is_debug_chrome_running(port):
+            return
+        time.sleep(0.2)
+    print(f"Chrome wystartował, ale port {port} nie odpowiada. Sprawdź czy jakiś inny Chrome nie blokuje.")
+    sys.exit(1)
+
+
+def build_driver(attach: bool = False) -> webdriver.Chrome:
     opts = Options()
+    if attach:
+        opts.debugger_address = f"127.0.0.1:{DEBUG_PORT}"
+        return webdriver.Chrome(options=opts)
+
+    # Ukrywamy wszystkie "developerskie" wskazowki w oknie Chrome.
     opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-infobars")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    return webdriver.Chrome(options=opts)
+    opts.add_experimental_option("useAutomationExtension", False)
+    driver = webdriver.Chrome(options=opts)
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"},
+        )
+    except Exception:
+        pass
+    return driver
+
+
+def ask_browser_mode() -> bool:
+    """Zwraca True, jeśli pracujemy w trybie 'attach to Chrome'."""
+    print("\nTryb przeglądarki:")
+    print("  [1] Otwórz Chrome (skrypt sam go uruchomi) i podepnij się do niego — domyślnie")
+    print("  [2] Uruchom nowe okno Chrome sterowane bezpośrednio przez Selenium")
+    print("  [3] Podepnij się do już otwartego Chrome (jeżeli uruchomiłeś go wcześniej sam)")
+    choice = input("Wybór [1]: ").strip() or "1"
+
+    if choice == "2":
+        return False
+
+    if choice == "3":
+        if not is_debug_chrome_running():
+            print(f"\nNie widzę Chrome z DevTools na porcie {DEBUG_PORT}.")
+            sys.exit(1)
+        print("OK — podpinam się do działającego Chrome.")
+        return True
+
+    launch_debug_chrome()
+    return True
 
 
 def text_or_empty(driver, xpath: str) -> str:
@@ -445,7 +553,8 @@ def main() -> None:
             print("OK — pomijam wiersze już wypełnione.")
     # -------------------------------------------------------------------------
 
-    driver = build_driver()
+    attach = ask_browser_mode()
+    driver = build_driver(attach=attach)
     done = 0
     try:
         for row in range(2, ws.max_row + 1):
@@ -491,7 +600,14 @@ def main() -> None:
             done += 1
             print(f"[wiersz {row}] Zapisano.")
     finally:
-        driver.quit()
+        if attach:
+            # Nie zamykamy Chrome użytkownika — odłączamy się tylko od sesji.
+            try:
+                driver.service.stop()
+            except Exception:
+                pass
+        else:
+            driver.quit()
 
     print(f"\nGotowe. Wykonano {done} zapytań. Plik: {xlsx_path}")
 
